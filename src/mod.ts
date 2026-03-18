@@ -46,6 +46,7 @@ export type { NotificationHandler, RequestHandler } from "./core/message-router.
 
 // Resource resolver
 export { parseResourceUri, resolveToHttp } from "./core/resource-resolver.ts";
+export type { ResolveToHttpOptions } from "./core/resource-resolver.ts";
 
 // Protocol builders and validators
 export {
@@ -108,7 +109,11 @@ export type { LineAdapterConfig, LiffSdk } from "./adapters/line/types.ts";
 // Resource server
 export { buildCspHeader } from "./resource-server/csp.ts";
 export type { CspOptions } from "./resource-server/csp.ts";
+export { createTelegramAuthHandler } from "./resource-server/auth.ts";
+export type { BridgeAuthHandler, BridgeAuthResult } from "./resource-server/auth.ts";
 export { injectBridgeScript } from "./resource-server/injector.ts";
+export { JsonRpcMcpBackend } from "./resource-server/backend.ts";
+export type { JsonRpcMcpBackendOptions, McpBackend, UiResourceResponse } from "./resource-server/backend.ts";
 export { SessionStore } from "./resource-server/session.ts";
 export type { BridgeSession, PendingNotification } from "./resource-server/session.ts";
 export { startResourceServer, buildToolResultFromData } from "./resource-server/server.ts";

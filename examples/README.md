@@ -14,11 +14,11 @@ The demo consists of:
 **1. Start the server**
 
 ```bash
-cd lib/mcp-apps-bridge
-deno run --allow-net --allow-read examples/demo-time/start.ts
+cd lib/mcp-bridge
+TELEGRAM_BOT_TOKEN=123456:ABC-DEF deno run --allow-net --allow-read --allow-env examples/demo-time/start.ts
 ```
 
-The server starts on port 4000. Open `http://localhost:4000/app/demo-time/index.html` in a browser to test locally.
+The server starts on port 4000 and is intended to be opened from Telegram, because the WebSocket session is authenticated with Telegram `initData`.
 
 **2. Expose via ngrok** (for Telegram testing)
 

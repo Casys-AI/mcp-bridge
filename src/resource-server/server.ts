@@ -15,13 +15,15 @@
  */
 
 import type { BridgeOptions, McpAppsMessage } from "../core/types.ts";
-import { isJsonRpcMessage } from "../core/protocol.ts";
+import { buildErrorResponse, isJsonRpcMessage } from "../core/protocol.ts";
 import { buildCspHeader } from "./csp.ts";
 import type { CspOptions } from "./csp.ts";
+import { createTelegramAuthHandler } from "./auth.ts";
+import type { BridgeAuthHandler } from "./auth.ts";
+import type { McpBackend } from "./backend.ts";
 import { injectBridgeScript } from "./injector.ts";
 import { SessionStore } from "./session.ts";
 import type { BridgeSession, PendingNotification } from "./session.ts";
-import { validateTelegramInitData } from "./telegram-auth.ts";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -32,21 +34,36 @@ export interface ResourceServerConfig {
   /** Directory containing UI assets, keyed by server name (from ui:// URI). */
   readonly assetDirectories: Record<string, string>;
   /** Platform name for bridge.js configuration. */
-  readonly platform: "telegram" | "line";
+  readonly platform: string;
   /** Bridge options (port, CORS, debug). */
   readonly options?: BridgeOptions;
   /** Custom CSP options applied to served HTML pages. */
   readonly csp?: CspOptions;
   /**
-   * Telegram bot token for HMAC-SHA256 validation of initData.
-   * Required when platform is "telegram". If omitted for telegram,
-   * the server will throw at startup (fail-fast).
+   * Optional platform auth handler. If provided, the webview must authenticate
+   * over WebSocket before it can send JSON-RPC traffic.
+   */
+  readonly auth?: BridgeAuthHandler;
+  /**
+   * Convenience shortcut for Telegram auth. If `auth` is omitted and
+   * `platform === "telegram"`, this token is used to create the default
+   * Telegram auth handler.
    */
   readonly telegramBotToken?: string;
   /**
+   * Optional MCP backend used to forward UI messages and resolve `ui://`
+   * resources via the built-in `/ui?uri=...` route.
+   */
+  readonly backend?: McpBackend;
+  /**
+   * Path of the built-in UI proxy route. Defaults to `/ui`.
+   * Set to `null` to disable the built-in route entirely.
+   */
+  readonly uiPath?: string | null;
+  /**
    * Handler called when a JSON-RPC message is received from a webview.
-   * The server forwards tool calls here; the handler should call the
-   * MCP server and return a response.
+   * Runs before `backend.handleMessage()`. Return `null` to fall through
+   * to the configured backend (if any).
    * Only called for authenticated sessions.
    */
   readonly onMessage?: (
@@ -164,20 +181,26 @@ function normalizeDir(p: string): string {
 export function startResourceServer(
   config: ResourceServerConfig,
 ): ResourceServer {
+  const authHandler = config.auth ??
+    (config.telegramBotToken
+      ? createTelegramAuthHandler(config.telegramBotToken)
+      : undefined);
+
   // -----------------------------------------------------------------------
-  // Fail-fast: telegram requires botToken
+  // Fail-fast: telegram requires an auth strategy by default
   // -----------------------------------------------------------------------
-  if (config.platform === "telegram" && !config.telegramBotToken) {
+  if (config.platform === "telegram" && !authHandler) {
     throw new Error(
-      "[ResourceServer] telegramBotToken is required when platform is 'telegram'. " +
-      "Provide the Telegram Bot token for initData HMAC-SHA256 validation.",
+      "[ResourceServer] Telegram requires an auth handler. " +
+      "Provide `telegramBotToken` or a custom `auth` handler.",
     );
   }
 
-  const requiresAuth = !!config.telegramBotToken;
+  const requiresAuth = !!authHandler;
   const port = config.options?.resourceServerPort ?? 0;
   const allowedOrigins = config.options?.allowedOrigins ?? ["*"];
   const debug = config.options?.debug ?? false;
+  const uiPath = config.uiPath === undefined ? "/ui" : config.uiPath;
   const MAX_SESSIONS = 10_000;
   const sessions = new SessionStore();
   const wsConnections = new Map<string, WebSocket>();
@@ -347,24 +370,40 @@ export function startResourceServer(
           // Auth-on-first-message: handle auth before any JSON-RPC
           // -------------------------------------------------------------------
           if (requiresAuth && !session.authenticated) {
-            if (data && data.type === "auth" && typeof data.initData === "string") {
-              const authResult = await validateTelegramInitData(
-                data.initData,
-                config.telegramBotToken!,
-              );
-
-              if (authResult.valid) {
-                session.authenticated = true;
-                session.userId = authResult.userId;
-                session.username = authResult.username;
-                log("Authenticated session", sessionId, "userId:", authResult.userId);
-                if (socket.readyState === 1) {
-                  socket.send(JSON.stringify({ type: "auth_ok", userId: authResult.userId }));
+            if (isRecord(data) && data.type === "auth" && authHandler) {
+              try {
+                const authResult = await authHandler(session, data);
+                if (authResult.valid) {
+                  session.authenticated = true;
+                  session.principalId = authResult.principalId;
+                  if (typeof authResult.principalId === "number") {
+                    session.userId = authResult.principalId;
+                  }
+                  session.username = authResult.username;
+                  session.authContext = authResult.context;
+                  log("Authenticated session", sessionId, "principal:", authResult.principalId);
+                  if (socket.readyState === 1) {
+                    socket.send(JSON.stringify({
+                      type: "auth_ok",
+                      principalId: authResult.principalId,
+                      ...(typeof authResult.principalId === "number"
+                        ? { userId: authResult.principalId }
+                        : {}),
+                      ...(authResult.username ? { username: authResult.username } : {}),
+                    }));
+                  }
+                } else {
+                  log("Auth failed for", sessionId, ":", authResult.error);
+                  if (socket.readyState === 1) {
+                    socket.send(JSON.stringify({ type: "auth_error", error: authResult.error }));
+                    socket.close(4001, "Authentication failed");
+                  }
                 }
-              } else {
-                log("Auth failed for", sessionId, ":", authResult.error);
+              } catch (err) {
+                const errorMessage = err instanceof Error ? err.message : String(err);
+                log("Auth handler error for", sessionId, ":", errorMessage);
                 if (socket.readyState === 1) {
-                  socket.send(JSON.stringify({ type: "auth_error", error: authResult.error }));
+                  socket.send(JSON.stringify({ type: "auth_error", error: errorMessage }));
                   socket.close(4001, "Authentication failed");
                 }
               }
@@ -391,14 +430,24 @@ export function startResourceServer(
           const message = data as McpAppsMessage;
           log("Received from", sessionId, ":", (message as { method?: string }).method ?? "response");
 
-          if (config.onMessage) {
-            const response = await config.onMessage(session, message);
-            if (response && socket.readyState === 1 /* OPEN */) {
-              socket.send(JSON.stringify(response));
-            }
+          const response = await routeMessage(
+            session,
+            message,
+            config.onMessage,
+            config.backend,
+          );
+          if (response && socket.readyState === 1 /* OPEN */) {
+            socket.send(JSON.stringify(response));
           }
         } catch (err) {
           log("Error handling message from", sessionId, ":", err);
+          if (isJsonRpcMessageCandidate(event.data)) {
+            const candidate = parseJsonRpcCandidate(event.data);
+            if (candidate && "method" in candidate && "id" in candidate && socket.readyState === 1) {
+              const errorMessage = err instanceof Error ? err.message : String(err);
+              socket.send(JSON.stringify(buildErrorResponse(candidate.id, -32603, errorMessage)));
+            }
+          }
         }
       };
 
@@ -436,6 +485,10 @@ export function startResourceServer(
           result.pendingNotifications,
         );
       }
+    }
+
+    if (uiPath && path === uiPath && request.method === "GET") {
+      return await serveBackendUiResource(request, config, corsHeaders(request));
     }
 
     return new Response("Not Found", { status: 404, headers: corsHeaders(request) });
@@ -483,7 +536,12 @@ export function startResourceServer(
         // For HTML files, inject bridge script and set CSP
         if (mime.startsWith("text/html")) {
           const session = sessions.create(cfg.platform);
-          const bridgeScriptUrl = `/bridge.js?platform=${cfg.platform}&session=${session.id}`;
+          const bridgeScriptUrl = buildBridgeScriptUrl(
+            cfg.platform,
+            session.id,
+            requiresAuth,
+            debug,
+          );
           const injected = injectBridgeScript(content, bridgeScriptUrl);
           const cspHeader = buildCspHeader(cfg.csp);
 
@@ -532,6 +590,7 @@ export function startResourceServer(
     headers: Record<string, string>,
     originalRequest?: Request,
     notifications?: PendingNotification[],
+    cspOverride?: CspOptions,
   ): Response {
     const session = sessions.create(cfg.platform);
 
@@ -559,9 +618,14 @@ export function startResourceServer(
       log("Buffered", allNotifications.length, "notification(s) for session", session.id);
     }
 
-    const bridgeScriptUrl = `/bridge.js?platform=${cfg.platform}&session=${session.id}`;
+    const bridgeScriptUrl = buildBridgeScriptUrl(
+      cfg.platform,
+      session.id,
+      requiresAuth,
+      debug,
+    );
     const injected = injectBridgeScript(html, bridgeScriptUrl);
-    const cspHeader = buildCspHeader(cfg.csp);
+    const cspHeader = buildCspHeader(mergeCspOptions(cfg.csp, cspOverride));
 
     return new Response(injected, {
       status: 200,
@@ -571,6 +635,50 @@ export function startResourceServer(
         "Content-Security-Policy": cspHeader,
       },
     });
+  }
+
+  async function serveBackendUiResource(
+    request: Request,
+    cfg: ResourceServerConfig,
+    headers: Record<string, string>,
+  ): Promise<Response> {
+    const backend = cfg.backend;
+    if (!backend?.readResource) {
+      return new Response("UI proxy not configured", { status: 404, headers });
+    }
+
+    const url = new URL(request.url);
+    const uri = url.searchParams.get("uri");
+    if (!uri || !uri.startsWith("ui://")) {
+      return new Response("Missing or invalid ?uri parameter", { status: 400, headers });
+    }
+
+    try {
+      const resource = await backend.readResource(uri, request);
+      if (!resource) {
+        return new Response(`Resource not found: ${uri}`, { status: 404, headers });
+      }
+
+      if (typeof resource === "string") {
+        return serveProxiedHtml(resource, cfg, headers, request);
+      }
+
+      return serveProxiedHtml(
+        resource.html,
+        cfg,
+        headers,
+        request,
+        resource.pendingNotifications,
+        resource.csp,
+      );
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      log("Failed to resolve UI resource", uri, ":", errorMessage);
+      return new Response(`Failed to resolve resource: ${errorMessage}`, {
+        status: 502,
+        headers,
+      });
+    }
   }
 
   // Resolve the path to bridge.js relative to this module
@@ -637,6 +745,108 @@ export function startResourceServer(
       await server.shutdown();
     },
   };
+}
+
+async function routeMessage(
+  configSession: BridgeSession,
+  message: McpAppsMessage,
+  onMessage?: ResourceServerConfig["onMessage"],
+  backend?: McpBackend,
+): Promise<McpAppsMessage | null> {
+  if (onMessage) {
+    const response = await onMessage(configSession, message);
+    if (response !== null) {
+      return response;
+    }
+  }
+
+  if (backend) {
+    const response = await backend.handleMessage(configSession, message);
+    if (response !== null) {
+      return response;
+    }
+  }
+
+  if ("method" in message && "id" in message) {
+    return buildErrorResponse(
+      message.id,
+      -32601,
+      `Unhandled method: ${message.method}`,
+    );
+  }
+
+  return null;
+}
+
+function buildBridgeScriptUrl(
+  platform: string,
+  sessionId: string,
+  requiresAuth: boolean,
+  debug: boolean,
+): string {
+  const params = new URLSearchParams({
+    platform,
+    session: sessionId,
+  });
+  if (requiresAuth) {
+    params.set("auth", "1");
+  }
+  if (debug) {
+    params.set("debug", "1");
+  }
+  return `/bridge.js?${params.toString()}`;
+}
+
+function mergeCspOptions(
+  base?: CspOptions,
+  override?: CspOptions,
+): CspOptions {
+  return {
+    scriptSources: mergeStringLists(base?.scriptSources, override?.scriptSources),
+    connectSources: mergeStringLists(base?.connectSources, override?.connectSources),
+    frameAncestors: mergeStringLists(base?.frameAncestors, override?.frameAncestors),
+    allowInline: override?.allowInline ?? base?.allowInline,
+  };
+}
+
+function mergeStringLists(
+  first?: readonly string[],
+  second?: readonly string[],
+): readonly string[] | undefined {
+  if (!first && !second) {
+    return undefined;
+  }
+  return Array.from(new Set([...(first ?? []), ...(second ?? [])]));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isJsonRpcMessageCandidate(value: unknown): boolean {
+  if (typeof value !== "string") {
+    return isJsonRpcMessage(value);
+  }
+  try {
+    return isJsonRpcMessage(JSON.parse(value));
+  } catch {
+    return false;
+  }
+}
+
+function parseJsonRpcCandidate(value: unknown): McpAppsMessage | null {
+  if (isJsonRpcMessage(value)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return isJsonRpcMessage(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------

@@ -40,7 +40,7 @@ Deno.test("parseResourceUri - throws on empty server", () => {
 
 Deno.test("resolveToHttp - basic resolution", () => {
   const url = resolveToHttp("ui://my-app/index.html", "https://res.example.com");
-  assertEquals(url, "https://res.example.com/my-app/index.html");
+  assertEquals(url, "https://res.example.com/app/my-app/index.html");
 });
 
 Deno.test("resolveToHttp - with query params", () => {
@@ -48,16 +48,28 @@ Deno.test("resolveToHttp - with query params", () => {
     "ui://app/page?key=value",
     "https://res.example.com",
   );
-  assertEquals(url, "https://res.example.com/app/page?key=value");
+  assertEquals(url, "https://res.example.com/app/app/page?key=value");
 });
 
 Deno.test("resolveToHttp - base URL with trailing slash", () => {
   const url = resolveToHttp("ui://app/index.html", "https://res.example.com/");
-  assertEquals(url, "https://res.example.com/app/index.html");
+  assertEquals(url, "https://res.example.com/app/app/index.html");
 });
 
 Deno.test("resolveToHttp - accepts ResourceUri object", () => {
   const uri = parseResourceUri("ui://my-app/test");
   const url = resolveToHttp(uri, "http://localhost:8080");
-  assertEquals(url, "http://localhost:8080/my-app/test");
+  assertEquals(url, "http://localhost:8080/app/my-app/test");
+});
+
+Deno.test("resolveToHttp - query mode uses ui proxy route", () => {
+  const url = resolveToHttp(
+    "ui://my-app/index.html?tab=metrics",
+    "https://res.example.com",
+    { mode: "query" },
+  );
+  assertEquals(
+    url,
+    "https://res.example.com/ui?uri=ui%3A%2F%2Fmy-app%2Findex.html%3Ftab%3Dmetrics",
+  );
 });

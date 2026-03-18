@@ -26,10 +26,14 @@ export interface BridgeSession {
   lastActivity: number;
   /** Whether the session has been authenticated (e.g. Telegram initData validated). */
   authenticated: boolean;
+  /** Generic principal identifier returned by the active auth handler. */
+  principalId?: string | number;
   /** Telegram user ID (set after successful auth). */
   userId?: number;
   /** Telegram username (set after successful auth). */
   username?: string;
+  /** Arbitrary auth context attached by a platform auth handler. */
+  authContext?: Record<string, unknown>;
   /** Notifications to send when the WebSocket connects (e.g. tool-result). */
   pendingNotifications?: PendingNotification[];
 }

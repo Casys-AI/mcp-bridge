@@ -141,7 +141,7 @@ Deno.test("server-auth - fail-fast: telegram without botToken throws", () => {
   } catch (err) {
     threw = true;
     assertEquals(
-      (err as Error).message.includes("telegramBotToken is required"),
+      (err as Error).message.includes("Telegram requires an auth handler"),
       true,
     );
   }
@@ -296,6 +296,73 @@ Deno.test("server-auth - session created via HTML starts unauthenticated", async
     const session = server.sessions.get(sessionId);
     assertEquals(session?.authenticated, false);
     assertEquals(session?.userId, undefined);
+  } finally {
+    await server.stop();
+  }
+});
+
+Deno.test("server-auth - custom auth handler works for arbitrary platforms", async () => {
+  const server = startResourceServer({
+    assetDirectories: {},
+    platform: "custom-platform",
+    auth: (_session, message) => {
+      const payload = message.payload as Record<string, unknown> | undefined;
+      return Promise.resolve(
+        payload?.token === "ok"
+          ? {
+              valid: true,
+              principalId: "user-42",
+              username: "custom-user",
+              context: { provider: "custom-platform" },
+            }
+          : {
+              valid: false,
+              error: "bad token",
+            },
+      );
+    },
+    onMessage: (_session, message) => {
+      const req = message as McpAppsRequest;
+      return Promise.resolve({
+        jsonrpc: "2.0" as const,
+        id: req.id,
+        result: { echoedMethod: req.method },
+      });
+    },
+  });
+
+  try {
+    const sessionId = await createSessionId(server.baseUrl);
+    const ws = connectWs(server.baseUrl, sessionId);
+    await waitForOpen(ws);
+
+    ws.send(JSON.stringify({
+      type: "auth",
+      platform: "custom-platform",
+      payload: { token: "ok" },
+    }));
+
+    const authResponse = await waitForMessage(ws);
+    assertEquals(authResponse.type, "auth_ok");
+    assertEquals(authResponse.principalId, "user-42");
+
+    ws.send(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 99,
+      method: "tools/call",
+      params: { name: "generic_tool" },
+    }));
+
+    const rpcResponse = await waitForMessage(ws);
+    assertEquals(rpcResponse.id, 99);
+
+    const session = server.sessions.get(sessionId);
+    assertEquals(session?.authenticated, true);
+    assertEquals(session?.principalId, "user-42");
+    assertEquals(session?.username, "custom-user");
+    assertEquals(session?.authContext?.provider, "custom-platform");
+
+    ws.close();
   } finally {
     await server.stop();
   }

@@ -36,7 +36,7 @@ const server = startResourceServer({
   telegramBotToken: botToken,
   csp: {
     scriptSources: ["https://telegram.org"],
-    connectSources: ["wss://pml.casys.ai", "ws://localhost:4000"],
+    connectSources: ["ws://localhost:4000"],
     frameAncestors: ["https://web.telegram.org", "https://desktop-app.telegram.org"],
   },
   options: {
@@ -133,9 +133,6 @@ console.log(`
      https://<ngrok-id>.ngrok-free.app/app/demo-time/index.html
 
   4. Open your bot on Telegram mobile -> tap Menu Button
-
-  To test locally:
-     Open ${server.baseUrl}/app/demo-time/index.html in a browser.
 
 ====================================
 `);

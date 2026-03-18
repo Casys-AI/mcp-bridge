@@ -37,33 +37,26 @@ deno add jsr:@casys/mcp-bridge
 
 ## Quick Start
 
-### 1. Create a resource server with a tool handler
+### 1. Create a resource server
 
 ```typescript
-import { startResourceServer } from "@casys/mcp-bridge";
+import { JsonRpcMcpBackend, startResourceServer } from "@casys/mcp-bridge";
 
-const server = await startResourceServer({
-  port: 4000,
-  platform: "telegram",
-  appBaseDir: "./my-app",        // Directory containing your MCP App HTML
-  resourceBaseUrl: "https://my-domain.com",
-  onMessage: async (session, message) => {
-    // Handle tools/call requests from the UI
-    if (message.method === "tools/call") {
-      const toolName = message.params?.name;
-      if (toolName === "get_data") {
-        return {
-          jsonrpc: "2.0",
-          id: message.id,
-          result: { content: [{ type: "text", text: JSON.stringify({ value: 42 }) }] },
-        };
-      }
-    }
-    return null;
+const server = startResourceServer({
+  assetDirectories: {
+    "my-app": "./my-app",
   },
+  platform: "telegram",
+  telegramBotToken: process.env.TELEGRAM_BOT_TOKEN,
+  options: {
+    resourceServerPort: 4000,
+  },
+  backend: new JsonRpcMcpBackend({
+    endpointUrl: "https://my-mcp.example.com/mcp",
+  }),
 });
 
-console.log(`Bridge running at http://localhost:${server.port}`);
+console.log(`Bridge running at ${server.baseUrl}`);
 ```
 
 ### 2. Create your MCP App HTML
@@ -125,8 +118,8 @@ Then configure your Telegram bot via [@BotFather](https://t.me/BotFather):
 2. **Resource server** serves the MCP App HTML with `bridge.js` auto-injected
 3. **bridge.js** intercepts `postMessage` calls from the MCP App
 4. Messages are routed via **WebSocket** to the resource server
-5. Resource server forwards **`tools/call`** to your handler
-6. Response flows back: handler -> WebSocket -> bridge.js -> MCP App
+5. Resource server forwards **`tools/call`** and **`resources/read`** to your configured backend
+6. Response flows back: backend -> WebSocket -> bridge.js -> MCP App
 
 The MCP App doesn't know it's running in Telegram. It uses the standard MCP Apps SDK (`postMessage`), and the bridge handles the translation.
 
@@ -137,20 +130,26 @@ The MCP App doesn't know it's running in Telegram. It uses the standard MCP Apps
 ### Resource Server
 
 ```typescript
-import { startResourceServer } from "@casys/mcp-bridge";
+import { JsonRpcMcpBackend, startResourceServer } from "@casys/mcp-bridge";
 import type { ResourceServerConfig } from "@casys/mcp-bridge";
 
 const config: ResourceServerConfig = {
-  port: 4000,
+  assetDirectories: {
+    "my-app": "./my-app",
+  },
   platform: "telegram",
-  appBaseDir: "./my-app",
-  resourceBaseUrl: "https://my-domain.com",
+  telegramBotToken: process.env.TELEGRAM_BOT_TOKEN,
+  options: {
+    resourceServerPort: 4000,
+  },
   csp: {
     scriptSources: ["https://telegram.org"],
     connectSources: ["wss://my-domain.com"],
     frameAncestors: ["https://web.telegram.org"],
   },
-  onMessage: async (session, message) => { /* ... */ },
+  backend: new JsonRpcMcpBackend({
+    endpointUrl: "https://my-mcp.example.com/mcp",
+  }),
 };
 ```
 
@@ -193,7 +192,10 @@ import { parseResourceUri, resolveToHttp } from "@casys/mcp-bridge";
 
 const uri = parseResourceUri("ui://my-server/dashboard.html?tab=metrics");
 const httpUrl = resolveToHttp(uri, "https://my-domain.com");
-// => "https://my-domain.com/my-server/dashboard.html?tab=metrics"
+// => "https://my-domain.com/app/my-server/dashboard.html?tab=metrics"
+
+const proxyUrl = resolveToHttp(uri, "https://my-domain.com", { mode: "query" });
+// => "https://my-domain.com/ui?uri=ui%3A%2F%2Fmy-server%2Fdashboard.html%3Ftab%3Dmetrics"
 ```
 
 ---
@@ -205,7 +207,7 @@ const httpUrl = resolveToHttp(uri, "https://my-domain.com");
 | **Client** | `bridge.js` | IIFE injected into MCP App HTML. Intercepts postMessage, routes via WebSocket |
 | **Server** | `ResourceServer` | HTTP server (serves HTML + bridge.js), WebSocket endpoint, session management |
 | **Protocol** | `MessageRouter` | JSON-RPC 2.0 routing, pending request tracking, timeout |
-| **Adapters** | `TelegramPlatformAdapter` | Maps Telegram WebApp SDK to MCP Apps HostContext |
+| **Adapters** | Platform runtimes | Map host SDKs (Telegram today, extensible for others) to MCP Apps HostContext |
 | **Security** | `CSP` + `SessionStore` | Content-Security-Policy headers, session auth, path traversal protection |
 
 ---
@@ -213,7 +215,7 @@ const httpUrl = resolveToHttp(uri, "https://my-domain.com");
 ## Development
 
 ```bash
-# Run tests (87 tests)
+# Run tests
 deno task test
 
 # Type-check

@@ -7,17 +7,14 @@
  * back as MessageEvents.
  *
  * Query parameters (set by the resource server on the <script> tag):
- *   - platform: "telegram" | "line"
- *   - session: session ID (created by the resource server)
+ *   - platform: platform runtime identifier
+ *   - session: session ID created by the resource server
+ *   - auth: "1" when the server requires WebSocket auth
  *
  * @module bridge.js
  */
 (function () {
   "use strict";
-
-  // ---------------------------------------------------------------------------
-  // Read configuration from script tag query params
-  // ---------------------------------------------------------------------------
 
   var currentScript = document.currentScript;
   if (!currentScript) {
@@ -26,8 +23,11 @@
   }
 
   var scriptUrl = new URL(currentScript.src);
-  var PLATFORM = scriptUrl.searchParams.get("platform") || "unknown";
+  var PLATFORM = scriptUrl.searchParams.get("platform") || "generic";
   var SESSION_ID = scriptUrl.searchParams.get("session");
+  var AUTH_REQUIRED = scriptUrl.searchParams.get("auth") === "1";
+  var DEBUG = scriptUrl.searchParams.get("debug") === "1";
+
   if (!SESSION_ID) {
     console.error("[bridge.js] Missing 'session' query parameter.");
     return;
@@ -35,19 +35,12 @@
 
   var WS_BASE = scriptUrl.origin;
   var WS_URL = WS_BASE.replace(/^http/, "ws") + "/bridge?session=" + SESSION_ID;
-  var DEBUG = scriptUrl.searchParams.get("debug") === "1";
 
   function log() {
     if (DEBUG) {
       console.log.apply(console, ["[bridge.js]"].concat(Array.prototype.slice.call(arguments)));
     }
   }
-
-  log("Platform:", PLATFORM, "Session:", SESSION_ID);
-
-  // ---------------------------------------------------------------------------
-  // JSON-RPC helpers
-  // ---------------------------------------------------------------------------
 
   function isJsonRpc(msg) {
     return msg && typeof msg === "object" && msg.jsonrpc === "2.0";
@@ -61,46 +54,251 @@
     return ("result" in msg || "error" in msg) && "id" in msg;
   }
 
-  // ---------------------------------------------------------------------------
-  // Platform detection: Telegram theme
-  // ---------------------------------------------------------------------------
+  function getTimeZone() {
+    try {
+      return Intl.DateTimeFormat().resolvedOptions().timeZone;
+    } catch (_err) {
+      return "UTC";
+    }
+  }
 
-  function getTelegramTheme() {
-    var tg = window.Telegram && window.Telegram.WebApp;
+  function getPreferredTheme() {
+    try {
+      return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches
+        ? "dark"
+        : "light";
+    } catch (_err) {
+      return "light";
+    }
+  }
+
+  function buildGenericHostContext(platformType) {
+    var nav = window.navigator || {};
+    return {
+      theme: getPreferredTheme(),
+      styles: { variables: {} },
+      platform: platformType || "web",
+      locale: nav.language,
+      timeZone: getTimeZone(),
+      containerDimensions: {
+        width: typeof window.innerWidth === "number" ? window.innerWidth : undefined,
+        height: typeof window.innerHeight === "number" ? window.innerHeight : undefined,
+      },
+    };
+  }
+
+  function createGenericRuntime(name) {
+    return {
+      name: name || "generic",
+      getHostContext: function () {
+        return buildGenericHostContext(window.parent === window ? "web" : "mobile");
+      },
+      buildAuthMessage: function () {
+        return null;
+      },
+      openLink: function (url) {
+        window.open(url, "_blank");
+      },
+      onReady: function () {},
+      subscribeLifecycle: function (emitHostContextChanged) {
+        var media = null;
+        var themeHandler = function () {
+          var ctx = buildGenericHostContext(window.parent === window ? "web" : "mobile");
+          emitHostContextChanged({ theme: ctx.theme, styles: ctx.styles });
+        };
+        var resizeHandler = function () {
+          emitHostContextChanged({
+            containerDimensions: {
+              width: typeof window.innerWidth === "number" ? window.innerWidth : undefined,
+              height: typeof window.innerHeight === "number" ? window.innerHeight : undefined,
+            },
+          });
+        };
+
+        window.addEventListener("resize", resizeHandler);
+
+        if (window.matchMedia) {
+          media = window.matchMedia("(prefers-color-scheme: dark)");
+          if (typeof media.addEventListener === "function") {
+            media.addEventListener("change", themeHandler);
+          } else if (typeof media.addListener === "function") {
+            media.addListener(themeHandler);
+          }
+        }
+
+        return function () {
+          window.removeEventListener("resize", resizeHandler);
+          if (!media) return;
+          if (typeof media.removeEventListener === "function") {
+            media.removeEventListener("change", themeHandler);
+          } else if (typeof media.removeListener === "function") {
+            media.removeListener(themeHandler);
+          }
+        };
+      },
+    };
+  }
+
+  function getTelegramWebApp() {
+    return window.Telegram && window.Telegram.WebApp
+      ? window.Telegram.WebApp
+      : null;
+  }
+
+  function buildTelegramHostContext() {
+    var tg = getTelegramWebApp();
     if (!tg) {
-      return {
-        theme: "light",
-        styles: { variables: {} },
-        platform: "mobile",
-      };
+      return buildGenericHostContext("mobile");
     }
 
-    var isDark = tg.colorScheme === "dark";
-    var tp = tg.themeParams || {};
+    var themeParams = tg.themeParams || {};
     var variables = {};
-    var keys = Object.keys(tp);
+    var keys = Object.keys(themeParams);
     for (var i = 0; i < keys.length; i++) {
-      variables["--tg-" + keys[i].replace(/_/g, "-")] = tp[keys[i]];
+      variables["--tg-" + keys[i].replace(/_/g, "-")] = themeParams[keys[i]];
     }
 
     return {
-      theme: isDark ? "dark" : "light",
+      theme: tg.colorScheme === "dark" ? "dark" : "light",
       styles: { variables: variables },
       platform: "mobile",
       locale: tg.initDataUnsafe && tg.initDataUnsafe.user
         ? tg.initDataUnsafe.user.language_code
-        : undefined,
+        : (window.navigator && window.navigator.language),
+      timeZone: getTimeZone(),
+      containerDimensions: {
+        width: typeof window.innerWidth === "number" ? window.innerWidth : undefined,
+        height: tg.viewportStableHeight || window.innerHeight || undefined,
+      },
     };
   }
 
-  // ---------------------------------------------------------------------------
-  // Request tracking (for matching responses to outgoing requests)
-  // ---------------------------------------------------------------------------
+  function createTelegramRuntime() {
+    var generic = createGenericRuntime("telegram");
+    return {
+      name: "telegram",
+      getHostContext: buildTelegramHostContext,
+      buildAuthMessage: function () {
+        var tg = getTelegramWebApp();
+        if (!tg || !tg.initData) {
+          return null;
+        }
+        return {
+          type: "auth",
+          platform: "telegram",
+          payload: { initData: tg.initData },
+          initData: tg.initData,
+        };
+      },
+      openLink: function (url) {
+        var tg = getTelegramWebApp();
+        if (tg && typeof tg.openLink === "function") {
+          tg.openLink(url);
+          return;
+        }
+        generic.openLink(url);
+      },
+      onReady: function () {
+        var tg = getTelegramWebApp();
+        if (!tg) return;
+        if (typeof tg.ready === "function") {
+          tg.ready();
+        }
+        if (!tg.isExpanded && typeof tg.expand === "function") {
+          tg.expand();
+        }
+      },
+      subscribeLifecycle: function (emitHostContextChanged) {
+        var tg = getTelegramWebApp();
+        if (!tg || typeof tg.onEvent !== "function") {
+          return generic.subscribeLifecycle(emitHostContextChanged);
+        }
 
-  var pendingRequests = {}; // id -> { resolve, reject, timer }
+        var themeHandler = function () {
+          var ctx = buildTelegramHostContext();
+          emitHostContextChanged({ theme: ctx.theme, styles: ctx.styles });
+        };
+        var viewportHandler = function () {
+          emitHostContextChanged({
+            containerDimensions: {
+              width: typeof window.innerWidth === "number" ? window.innerWidth : undefined,
+              height: tg.viewportStableHeight || window.innerHeight || undefined,
+            },
+          });
+        };
+
+        tg.onEvent("themeChanged", themeHandler);
+        tg.onEvent("viewportChanged", viewportHandler);
+
+        return function () {
+          if (typeof tg.offEvent !== "function") return;
+          tg.offEvent("themeChanged", themeHandler);
+          tg.offEvent("viewportChanged", viewportHandler);
+        };
+      },
+    };
+  }
+
+  function getLiffSdk() {
+    return window.liff || null;
+  }
+
+  function createLineRuntime() {
+    var generic = createGenericRuntime("line");
+    return {
+      name: "line",
+      getHostContext: function () {
+        var ctx = buildGenericHostContext("mobile");
+        return {
+          theme: ctx.theme,
+          styles: ctx.styles,
+          platform: "mobile",
+          locale: ctx.locale,
+          timeZone: ctx.timeZone,
+          containerDimensions: ctx.containerDimensions,
+        };
+      },
+      buildAuthMessage: function () {
+        var liff = getLiffSdk();
+        if (!liff || typeof liff.getAccessToken !== "function") {
+          return null;
+        }
+        var accessToken = liff.getAccessToken();
+        if (!accessToken) {
+          return null;
+        }
+        return {
+          type: "auth",
+          platform: "line",
+          payload: { accessToken: accessToken },
+          accessToken: accessToken,
+        };
+      },
+      openLink: function (url) {
+        generic.openLink(url);
+      },
+      onReady: function () {},
+      subscribeLifecycle: generic.subscribeLifecycle,
+    };
+  }
+
+  var platformFactories = {
+    telegram: createTelegramRuntime,
+    line: createLineRuntime,
+  };
+
+  var platformRuntime = platformFactories[PLATFORM]
+    ? platformFactories[PLATFORM]()
+    : createGenericRuntime(PLATFORM);
+
+  var pendingRequests = {};
   var REQUEST_TIMEOUT_MS = 30000;
   var appInitialized = false;
-  var earlyNotifications = []; // notifications received before ui/initialize
+  var earlyNotifications = [];
+  var ws = null;
+  var reconnectAttempts = 0;
+  var MAX_RECONNECT = 5;
+  var authenticated = !AUTH_REQUIRED;
 
   function trackRequest(id) {
     return new Promise(function (resolve, reject) {
@@ -131,21 +329,58 @@
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // ui/initialize handler (synthesized locally)
-  // ---------------------------------------------------------------------------
+  var _realPostMessage = window.postMessage.bind(window);
+  var originalPostMessage = window.parent !== window
+    ? window.parent.postMessage.bind(window.parent)
+    : null;
+
+  function dispatchToApp(message) {
+    log("-> App:", message.method || ("id" in message ? "response#" + message.id : "?"));
+    _realPostMessage(message, scriptUrl.origin);
+  }
+
+  function queueOrDispatchNotification(message) {
+    if (!appInitialized) {
+      log("Queueing notification:", message.method);
+      earlyNotifications.push(message);
+      return;
+    }
+    dispatchToApp(message);
+  }
+
+  function emitHostContextChanged(params) {
+    queueOrDispatchNotification({
+      jsonrpc: "2.0",
+      method: "ui/notifications/host-context-changed",
+      params: params,
+    });
+  }
+
+  function dispatchReady(detail) {
+    window.dispatchEvent(new CustomEvent("mcp-bridge-ready", {
+      detail: Object.assign(
+        { platform: PLATFORM, session: SESSION_ID },
+        detail || {},
+      ),
+    }));
+  }
+
+  function dispatchAuthError(errorMessage) {
+    window.dispatchEvent(new CustomEvent("mcp-bridge-auth-error", {
+      detail: { error: errorMessage },
+    }));
+  }
 
   function handleInitialize(requestId) {
-    var hostCtx = getTelegramTheme();
-
+    var hostCtx = platformRuntime.getHostContext();
     var response = {
       jsonrpc: "2.0",
       id: requestId,
       result: {
         protocolVersion: "2025-11-25",
         hostInfo: {
-          name: "@casys/mcp-apps-bridge",
-          version: "0.1.0",
+          name: "@casys/mcp-bridge",
+          version: "0.2.0",
         },
         hostCapabilities: {
           serverTools: { listChanged: false },
@@ -158,9 +393,8 @@
     };
 
     dispatchToApp(response);
-
-    // App is now ready — flush any notifications received before init
     appInitialized = true;
+
     if (earlyNotifications.length > 0) {
       log("Flushing", earlyNotifications.length, "early notification(s)");
       for (var i = 0; i < earlyNotifications.length; i++) {
@@ -170,27 +404,6 @@
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Dispatch to App (via MessageEvent on window)
-  // ---------------------------------------------------------------------------
-
-  function dispatchToApp(message) {
-    log("-> App:", message.method || ("id" in message ? "response#" + message.id : "?"));
-    // Use real postMessage so event.source === window (=== window.parent in standalone).
-    // The MCP Apps SDK checks event.source — dispatchEvent leaves it null.
-    // Use the script origin as targetOrigin instead of "*" to prevent message leaking.
-    _realPostMessage(message, scriptUrl.origin);
-  }
-
-  // ---------------------------------------------------------------------------
-  // WebSocket connection
-  // ---------------------------------------------------------------------------
-
-  var ws = null;
-  var reconnectAttempts = 0;
-  var MAX_RECONNECT = 5;
-  var authenticated = false;
-
   function connectWs() {
     log("Connecting to", WS_URL);
     ws = new WebSocket(WS_URL);
@@ -198,64 +411,60 @@
     ws.onopen = function () {
       log("WebSocket connected");
       reconnectAttempts = 0;
+      authenticated = !AUTH_REQUIRED;
+      platformRuntime.onReady();
 
-      // Send auth immediately if Telegram SDK is available
-      var tg = window.Telegram && window.Telegram.WebApp;
-      if (tg && tg.initData) {
-        log("Sending Telegram auth...");
-        ws.send(JSON.stringify({ type: "auth", initData: tg.initData }));
-      } else {
-        // No Telegram SDK — server will decide if auth is required
-        log("No Telegram SDK, dispatching ready without auth");
-        authenticated = true;
-        window.dispatchEvent(new CustomEvent("mcp-bridge-ready", {
-          detail: { platform: PLATFORM, session: SESSION_ID },
-        }));
+      if (!AUTH_REQUIRED) {
+        dispatchReady();
+        return;
       }
+
+      var authMessage = platformRuntime.buildAuthMessage
+        ? platformRuntime.buildAuthMessage()
+        : null;
+
+      if (!authMessage) {
+        dispatchAuthError("Authentication required but no auth payload is available for platform " + PLATFORM + ".");
+        return;
+      }
+
+      log("Sending auth for platform", PLATFORM);
+      ws.send(JSON.stringify(authMessage));
     };
 
     ws.onmessage = function (event) {
       try {
         var msg = JSON.parse(event.data);
-        // Handle auth responses (non-JSON-RPC)
+
         if (msg && msg.type === "auth_ok") {
-          log("Authenticated, userId:", msg.userId);
           authenticated = true;
-          window.dispatchEvent(new CustomEvent("mcp-bridge-ready", {
-            detail: { platform: PLATFORM, session: SESSION_ID, userId: msg.userId },
-          }));
+          dispatchReady({
+            principalId: msg.principalId,
+            userId: msg.userId,
+            username: msg.username,
+          });
           return;
         }
 
         if (msg && msg.type === "auth_error") {
           console.error("[bridge.js] Authentication failed:", msg.error);
-          window.dispatchEvent(new CustomEvent("mcp-bridge-auth-error", {
-            detail: { error: msg.error },
-          }));
+          dispatchAuthError(msg.error);
           return;
         }
 
         if (!isJsonRpc(msg)) return;
 
-        // Responses: resolve tracked requests
         if (isResponse(msg)) {
           if ("error" in msg) {
             rejectRequest(msg.id, msg.error);
           } else {
             resolveRequest(msg.id, msg.result);
           }
-          // The trackRequest().then() will call dispatchToApp
           return;
         }
 
-        // Notifications from server
         if ("method" in msg && !("id" in msg)) {
-          if (!appInitialized) {
-            log("Queuing early notification:", msg.method);
-            earlyNotifications.push(msg);
-          } else {
-            dispatchToApp(msg);
-          }
+          queueOrDispatchNotification(msg);
         }
       } catch (err) {
         console.warn("[bridge.js] Failed to parse WS message:", err);
@@ -265,6 +474,7 @@
     ws.onclose = function () {
       log("WebSocket disconnected");
       ws = null;
+      authenticated = false;
       if (reconnectAttempts < MAX_RECONNECT) {
         reconnectAttempts++;
         var delay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 10000);
@@ -283,29 +493,15 @@
       console.warn("[bridge.js] WebSocket not connected. Dropping message:", message);
       return;
     }
-    if (!authenticated) {
+    if (AUTH_REQUIRED && !authenticated) {
       console.warn("[bridge.js] Not authenticated yet. Dropping message:", message);
       return;
     }
     ws.send(JSON.stringify(message));
   }
 
-  // ---------------------------------------------------------------------------
-  // Intercept postMessage (App -> Bridge)
-  // ---------------------------------------------------------------------------
-
-  // Save the REAL postMessage before we monkey-patch it.
-  // Used by dispatchToApp() so that event.source === window,
-  // which the MCP Apps SDK checks (event.source === window.parent).
-  var _realPostMessage = window.postMessage.bind(window);
-
-  var originalPostMessage = window.parent !== window
-    ? window.parent.postMessage.bind(window.parent)
-    : null;
-
   function interceptPostMessage() {
     if (window.parent === window) {
-      // Not in a frame — intercept window.postMessage instead for standalone mode
       log("Intercepting window.postMessage (standalone mode)");
       var origSelf = window.postMessage.bind(window);
       window.postMessage = function (message, targetOrigin, transfer) {
@@ -331,31 +527,22 @@
   function handleOutgoing(message) {
     log("<- App:", message.method || "response");
 
-    // ui/initialize — handle locally
     if (message.method === "ui/initialize" && "id" in message) {
       handleInitialize(message.id);
       return;
     }
 
-    // ui/open-link — handle locally via Telegram API or fallback
     if (message.method === "ui/open-link" && "id" in message) {
       var url = message.params && message.params.url;
       if (url) {
-        var tg = window.Telegram && window.Telegram.WebApp;
-        if (tg && tg.openLink) {
-          tg.openLink(url);
-        } else {
-          window.open(url, "_blank");
-        }
+        platformRuntime.openLink(url);
       }
       dispatchToApp({ jsonrpc: "2.0", id: message.id, result: {} });
       return;
     }
 
-    // Forward to resource server via WebSocket
     sendToServer(message);
 
-    // Track requests for response matching
     if (isRequest(message)) {
       trackRequest(message.id)
         .then(function (result) {
@@ -371,54 +558,9 @@
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Telegram lifecycle events
-  // ---------------------------------------------------------------------------
-
-  function setupTelegramEvents() {
-    var tg = window.Telegram && window.Telegram.WebApp;
-    if (!tg) return;
-
-    // Tell Telegram we're ready
-    tg.ready();
-    if (!tg.isExpanded) tg.expand();
-
-    // Theme changes
-    if (typeof tg.onEvent === "function") {
-      tg.onEvent("themeChanged", function () {
-        var ctx = getTelegramTheme();
-        dispatchToApp({
-          jsonrpc: "2.0",
-          method: "ui/notifications/host-context-changed",
-          params: { theme: ctx.theme, styles: ctx.styles },
-        });
-      });
-
-      tg.onEvent("viewportChanged", function () {
-        dispatchToApp({
-          jsonrpc: "2.0",
-          method: "ui/notifications/host-context-changed",
-          params: {
-            containerDimensions: {
-              width: window.innerWidth,
-              height: tg.viewportStableHeight || window.innerHeight,
-            },
-          },
-        });
-      });
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Boot
-  // ---------------------------------------------------------------------------
-
   interceptPostMessage();
+  platformRuntime.subscribeLifecycle(emitHostContextChanged);
   connectWs();
 
-  if (PLATFORM === "telegram") {
-    setupTelegramEvents();
-  }
-
-  log("Bridge initialized for", PLATFORM);
+  log("Bridge initialized for", PLATFORM, "(auth required:", AUTH_REQUIRED + ")");
 })();

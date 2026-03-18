@@ -292,8 +292,8 @@ export class BridgeClient {
     }
 
     const info = this.options.bridgeInfo ?? {
-      name: "@casys/mcp-apps-bridge",
-      version: "0.1.0",
+      name: "@casys/mcp-bridge",
+      version: "0.2.0",
     };
 
     const capabilities: HostCapabilities = {
