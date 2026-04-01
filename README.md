@@ -1,3 +1,5 @@
+> **This repository has been archived.** Development continues in the monorepo: [Casys-AI/mcp-server](https://github.com/Casys-AI/mcp-server/tree/main/packages/bridge)
+
 # @casys/mcp-bridge
 
 [![npm](https://img.shields.io/npm/v/@casys/mcp-bridge)](https://www.npmjs.com/package/@casys/mcp-bridge)
